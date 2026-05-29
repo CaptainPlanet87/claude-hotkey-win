@@ -111,18 +111,19 @@ enum Action {
     TogglePill,
 }
 
-// ===== Ctrl+Shift-Doppeltipp via Low-Level-Keyboard-Hook =====
-// RegisterHotKey kann keine reinen Modifier. Daher ein WH_KEYBOARD_LL-Hook,
-// der zwei saubere Ctrl+Shift-"Chords" (beide Modifier runter+hoch, ohne andere
-// Taste dazwischen) innerhalb von DOUBLE_WINDOW_MS erkennt -> Picker.
-// Das Flag wird im Event-Loop gepollt.
+// ===== Geste: Strg HALTEN + Shift 2x tippen -> Picker =====
+// RegisterHotKey kann keine reinen Modifier-Gesten. Daher ein
+// WH_KEYBOARD_LL-Hook, der Shift-Down-Flanken zaehlt, SOLANGE Strg
+// durchgehend gehalten wird. Zwei Flanken innerhalb SHIFT_DOUBLE_WINDOW_MS
+// -> GESTURE_FIRED (wird im Event-Loop gepollt). Strg loslassen oder eine
+// andere Taste druecken setzt den Zaehler zurueck. Auto-Repeat von Shift
+// (gehaltene Taste) wird ignoriert — nur echte Down-Flanken zaehlen.
 static GESTURE_FIRED: AtomicBool = AtomicBool::new(false);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
-static CHORD_ARMED: AtomicBool = AtomicBool::new(false);
-static OTHER_DOWN: AtomicBool = AtomicBool::new(false);
-static LAST_CHORD_MS: AtomicI64 = AtomicI64::new(0);
-const DOUBLE_WINDOW_MS: i64 = 450;
+static SHIFT_TAPS: AtomicI64 = AtomicI64::new(0);
+static LAST_SHIFT_MS: AtomicI64 = AtomicI64::new(0);
+const SHIFT_DOUBLE_WINDOW_MS: i64 = 600;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -142,7 +143,7 @@ unsafe extern "system" fn ll_keyboard_proc(
         VK_RSHIFT, VK_SHIFT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
     if code == HC_ACTION {
-        let kb = &*(lparam as *const KBDLLHOOKSTRUCT);
+        let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
         let vk = kb.vkCode as i32;
         let down = wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize;
         let up = wparam == WM_KEYUP as usize || wparam == WM_SYSKEYUP as usize;
@@ -153,38 +154,42 @@ unsafe extern "system" fn ll_keyboard_proc(
             if is_ctrl {
                 CTRL_DOWN.store(true, Ordering::SeqCst);
             } else if is_shift {
-                SHIFT_DOWN.store(true, Ordering::SeqCst);
+                // Nur die Down-FLANKE zaehlen (Auto-Repeat ignorieren).
+                let was_down = SHIFT_DOWN.swap(true, Ordering::SeqCst);
+                if !was_down && CTRL_DOWN.load(Ordering::SeqCst) {
+                    let now = now_ms();
+                    let last = LAST_SHIFT_MS.swap(now, Ordering::SeqCst);
+                    if SHIFT_TAPS.load(Ordering::SeqCst) >= 1
+                        && last != 0
+                        && now - last <= SHIFT_DOUBLE_WINDOW_MS
+                    {
+                        // Zweiter Shift-Tipp im Zeitfenster -> Geste feuert.
+                        GESTURE_FIRED.store(true, Ordering::SeqCst);
+                        SHIFT_TAPS.store(0, Ordering::SeqCst);
+                        LAST_SHIFT_MS.store(0, Ordering::SeqCst);
+                    } else {
+                        // Erster Tipp (oder zu langsam) -> als ersten werten.
+                        SHIFT_TAPS.store(1, Ordering::SeqCst);
+                    }
+                }
             } else {
-                OTHER_DOWN.store(true, Ordering::SeqCst);
-            }
-            if CTRL_DOWN.load(Ordering::SeqCst)
-                && SHIFT_DOWN.load(Ordering::SeqCst)
-                && !OTHER_DOWN.load(Ordering::SeqCst)
-            {
-                CHORD_ARMED.store(true, Ordering::SeqCst);
+                // Andere Taste bei gehaltenem Strg -> Geste abbrechen.
+                SHIFT_TAPS.store(0, Ordering::SeqCst);
+                LAST_SHIFT_MS.store(0, Ordering::SeqCst);
             }
         } else if up {
             if is_ctrl {
                 CTRL_DOWN.store(false, Ordering::SeqCst);
+                // Strg muss durchgehend gehalten werden -> Reset beim Loslassen.
+                SHIFT_TAPS.store(0, Ordering::SeqCst);
+                LAST_SHIFT_MS.store(0, Ordering::SeqCst);
             }
             if is_shift {
                 SHIFT_DOWN.store(false, Ordering::SeqCst);
             }
-            if !CTRL_DOWN.load(Ordering::SeqCst) && !SHIFT_DOWN.load(Ordering::SeqCst) {
-                if CHORD_ARMED.load(Ordering::SeqCst) && !OTHER_DOWN.load(Ordering::SeqCst) {
-                    let now = now_ms();
-                    let last = LAST_CHORD_MS.swap(now, Ordering::SeqCst);
-                    if last != 0 && now - last <= DOUBLE_WINDOW_MS {
-                        GESTURE_FIRED.store(true, Ordering::SeqCst);
-                        LAST_CHORD_MS.store(0, Ordering::SeqCst);
-                    }
-                }
-                CHORD_ARMED.store(false, Ordering::SeqCst);
-                OTHER_DOWN.store(false, Ordering::SeqCst);
-            }
         }
     }
-    CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
 #[cfg(windows)]
@@ -202,10 +207,10 @@ fn install_ll_hook() {
             let hmod = GetModuleHandleW(std::ptr::null());
             let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), hmod, 0);
             if hook.is_null() {
-                log::warn!("LL-Keyboard-Hook nicht installiert — Ctrl+Shift-Doppeltipp inaktiv");
+                log::warn!("LL-Keyboard-Hook nicht installiert — Geste (Strg halten + Shift 2x) inaktiv");
                 return;
             }
-            log::info!("LL-Keyboard-Hook aktiv (eigener Thread): Ctrl+Shift-Doppeltipp -> Picker");
+            log::info!("LL-Keyboard-Hook aktiv (eigener Thread): Strg halten + Shift 2x -> Picker");
             let mut msg: MSG = std::mem::zeroed();
             // GetMessageW haelt den Thread am Pumpen -> Hook wird prompt bedient.
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
@@ -238,11 +243,11 @@ pub fn run_daemon(cfg: Config) -> Result<()> {
     let manager = GlobalHotKeyManager::new()?;
 
     // Hotkeys best-effort registrieren (Konflikt/Fehler killt den Daemon nicht;
-    // der Ctrl+Shift-Doppeltipp funktioniert unabhaengig).
+    // die Geste "Strg halten + Shift 2x" funktioniert unabhaengig davon).
     let picker_id = register_hotkey(&manager, &cfg.picker_hotkey, "picker");
     let pill_id = register_hotkey(&manager, &cfg.pill_toggle_hotkey, "pill");
 
-    // Ctrl+Shift-Doppeltipp via Low-Level-Keyboard-Hook.
+    // Geste "Strg halten + Shift 2x" via Low-Level-Keyboard-Hook.
     #[cfg(windows)]
     install_ll_hook();
 
@@ -258,9 +263,9 @@ pub fn run_daemon(cfg: Config) -> Result<()> {
         // und den Channel nie wieder leeren -> Hotkeys reagieren nicht.
         *control_flow = ControlFlow::Poll;
 
-        // Ctrl+Shift-Doppeltipp (Low-Level-Hook)?
+        // Geste "Strg halten + Shift 2x" (Low-Level-Hook)?
         if GESTURE_FIRED.swap(false, Ordering::SeqCst) {
-            log::info!("[gesture] Ctrl+Shift Doppeltipp -> Picker");
+            log::info!("[gesture] Strg halten + Shift 2x -> Picker");
             spawn_listpicker();
         }
 

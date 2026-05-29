@@ -61,22 +61,33 @@ pub fn deliver(antwort: &str, mode: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Popup: einfaches iced-Fenster mit Text. Definition in `popup.rs`,
-/// aber pragmatisch verwenden wir vorerst die Windows-MessageBox.
+/// Ergebnis-Anzeige: startet das bearbeitbare iced-Fenster (`--result`,
+/// siehe result.rs) als eigenen Prozess. Loest die alte, nicht editierbare
+/// PowerShell-MessageBox ab.
 fn show_popup(text: &str, label: &str) -> Result<()> {
-    // Pragmatisch: powershell zeigt das Toast + Text in einem MsgBox-Fenster
-    // an. Lange Texte werden gekürzt — Vollversion liegt im Clipboard.
-    let preview: String = text.chars().take(800).collect();
-    let safe = preview.replace('\'', "''").replace('\n', "`n");
-    let script = format!(
-        "Add-Type -AssemblyName PresentationFramework; \
-         [System.Windows.MessageBox]::Show('{}','{}','OK','Information') | Out-Null",
-        safe, label.replace('\'', "''")
-    );
-    std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
+    // Bearbeitbares Ergebnis-Fenster als EIGENER Prozess starten. Text geht
+    // ueber stdin (kein Arg-Laengen-/Escaping-Limit). Das Fenster ueberlebt den
+    // beendenden Worker, weil es ein eigenstaendiger Prozess ist.
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("claude-hotkey.exe"));
+    match Command::new(exe)
+        .args(["--result", label])
+        .stdin(Stdio::piped())
         .spawn()
-        .ok();
+    {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+                // stdin droppt hier -> Pipe-EOF -> Fenster kann zu Ende lesen.
+            }
+        }
+        Err(e) => {
+            log::error!("result-window spawn: {e}");
+            notify(label, text); // Fallback: wenigstens als Toast zeigen.
+        }
+    }
     Ok(())
 }
 
@@ -101,11 +112,36 @@ pub fn ask_user(titel: &str, prompt: &str) -> Result<String> {
 #[cfg(windows)]
 fn send_ctrl_c() {
     use winapi::um::winuser::{
-        INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CONTROL,
+        INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CONTROL, VK_MENU,
+        VK_SHIFT,
     };
     use std::mem::{size_of, zeroed};
 
     unsafe {
+        // Zuerst evtl. gehaltene Modifier lösen: Wird der Picker per
+        // Strg+Shift-Geste geöffnet, hält der User evtl. noch Shift — dann
+        // würde aus unserem Strg+C ein Strg+Shift+C (öffnet Konsole/DevTools,
+        // kopiert NICHT). Alt analog.
+        let mut rel: [INPUT; 2] = [zeroed(); 2];
+        rel[0].type_ = INPUT_KEYBOARD;
+        *rel[0].u.ki_mut() = KEYBDINPUT {
+            wVk: VK_SHIFT as u16,
+            wScan: 0,
+            dwFlags: KEYEVENTF_KEYUP,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        rel[1].type_ = INPUT_KEYBOARD;
+        *rel[1].u.ki_mut() = KEYBDINPUT {
+            wVk: VK_MENU as u16,
+            wScan: 0,
+            dwFlags: KEYEVENTF_KEYUP,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        SendInput(rel.len() as u32, rel.as_mut_ptr(), size_of::<INPUT>() as i32);
+        std::thread::sleep(Duration::from_millis(25));
+
         let mut inputs: [INPUT; 4] = [zeroed(); 4];
         // Ctrl down
         inputs[0].type_ = INPUT_KEYBOARD;

@@ -5,6 +5,7 @@
 use crate::backend;
 use crate::config::{Config, config_path};
 use crate::output;
+use std::sync::OnceLock;
 use iced::theme::Style as Appearance;
 use iced::widget::{button, container, stack, text, Space};
 use iced::window::{Level, Position};
@@ -18,9 +19,12 @@ const RING_RADIUS: f32 = 170.0;
 const ITEM_W: f32 = 130.0;
 const ITEM_H: f32 = 36.0;
 
+/// Einmal gegriffene Auswahl — siehe listpicker.rs. Verhindert die
+/// Doppel-/Dreifach-Greifung, die sonst leer zurückkommt.
+static GRABBED_SELECTION: OnceLock<String> = OnceLock::new();
+
 struct State {
     modi: Vec<(String, String)>,
-    cfg: Config,
     selection: String,
 }
 
@@ -32,9 +36,10 @@ impl Default for State {
             .iter()
             .map(|(id, m)| (id.clone(), m.label.clone()))
             .collect();
-        // Selection JETZT grabben — vor Window aufgeht
-        let selection = output::get_selection_via_clipboard().unwrap_or_default();
-        Self { modi, cfg, selection }
+        // Auswahl wurde in run() bereits gegriffen (mit App-Fokus) — hier nur
+        // noch lesen, NICHT erneut greifen (sonst leer, weil Fokus weg).
+        let selection = GRABBED_SELECTION.get().cloned().unwrap_or_default();
+        Self { modi, selection }
     }
 }
 
@@ -46,13 +51,9 @@ enum Message {
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::ModeChosen(id) => {
-            let cfg = state.cfg.clone();
-            let selection = state.selection.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = backend::run_mode(&cfg, &id, Some(selection)) {
-                    log::error!("backend: {e}");
-                }
-            });
+            // Eigener Worker-Prozess (backend::spawn_mode_worker): muss den
+            // Picker ueberleben, sonst killt process::exit(0) die Arbeit sofort.
+            backend::spawn_mode_worker(&id, &state.selection);
             std::process::exit(0);
         }
     }
@@ -142,6 +143,11 @@ fn style(_state: &State, _theme: &Theme) -> Appearance {
     }
 }
 
+/// Startup-Task: Fenster in den Vordergrund holen (Tastatur-Fokus).
+fn focus_on_open() -> Task<Message> {
+    iced::window::latest().and_then(iced::window::gain_focus::<Message>)
+}
+
 pub fn run() -> anyhow::Result<()> {
     // Pre-check: ohne Selection kein UI öffnen
     let sel = output::get_selection_via_clipboard().unwrap_or_default();
@@ -152,8 +158,13 @@ pub fn run() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    let _ = GRABBED_SELECTION.set(sel);
 
-    iced::application(State::default, update, view)
+    iced::application(
+        || (State::default(), focus_on_open()),
+        update,
+        view,
+    )
         .style(style)
         .window(iced::window::Settings {
             size: Size::new(WINDOW_W as f32, WINDOW_H as f32),

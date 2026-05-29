@@ -10,14 +10,20 @@ use iced::widget::{button, column, container, scrollable, text};
 use iced::window::{Level, Position};
 use iced::{Background, Border, Color, Element, Event, Length, Shadow, Size, Subscription, Task, Theme};
 use std::process::Command;
+use std::sync::OnceLock;
 
 const WINDOW_W: u32 = 400;
 const WINDOW_H: u32 = 360;
 const SETTINGS_ID: &str = "__settings__";
 
+/// Einmal gegriffene Auswahl (in `run()` befüllt, solange die Quell-App noch
+/// den Fokus hat). `State::default` liest hier, statt erneut zu greifen —
+/// sonst kommt die zweite Greifung leer zurück, weil dann schon das
+/// Picker-Fenster den Fokus hat ("Kein Text markiert").
+static GRABBED_SELECTION: OnceLock<String> = OnceLock::new();
+
 struct State {
     modi: Vec<(String, String)>,
-    cfg: Config,
     selection: String,
     selected_idx: usize,
 }
@@ -35,10 +41,9 @@ impl Default for State {
             "⚙️ Einstellungen (config.json öffnen)".to_string(),
         ));
 
-        let selection = output::get_selection_via_clipboard().unwrap_or_default();
+        let selection = GRABBED_SELECTION.get().cloned().unwrap_or_default();
         Self {
             modi,
-            cfg,
             selection,
             selected_idx: 0,
         }
@@ -99,13 +104,10 @@ fn execute(state: &State, idx: usize) {
         std::process::exit(0);
     }
     if !id.is_empty() {
-        let cfg = state.cfg.clone();
-        let selection = state.selection.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = backend::run_mode(&cfg, &id, Some(selection)) {
-                log::error!("backend: {e}");
-            }
-        });
+        // Backend in EIGENEM Prozess starten, der den Picker ueberlebt — sonst
+        // killt das folgende process::exit(0) die Arbeit sofort mit (das war
+        // "ich klicke Uebersetzen und nichts passiert").
+        backend::spawn_mode_worker(&id, &state.selection);
         std::process::exit(0);
     }
 }
@@ -178,6 +180,13 @@ fn subscription(_state: &State) -> Subscription<Message> {
     iced::event::listen().map(Message::Event)
 }
 
+/// Startup-Task: Fenster in den Vordergrund holen, damit Tastatur-Events
+/// (Esc/Tab/Enter) ankommen. Vom Daemon (Hintergrundprozess) gespawnte
+/// Fenster bekommen sonst keinen Fokus -> Esc tat nichts.
+fn focus_on_open() -> Task<Message> {
+    iced::window::latest().and_then(iced::window::gain_focus::<Message>)
+}
+
 pub fn run() -> anyhow::Result<()> {
     let sel = output::get_selection_via_clipboard().unwrap_or_default();
     if sel.trim().is_empty() {
@@ -187,8 +196,15 @@ pub fn run() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    // Genau EINMAL greifen und merken. Würde State::default erneut greifen,
+    // läge der Fokus schon beim Picker-Fenster -> leere Auswahl.
+    let _ = GRABBED_SELECTION.set(sel);
 
-    iced::application(State::default, update, view)
+    iced::application(
+        || (State::default(), focus_on_open()),
+        update,
+        view,
+    )
         .style(style)
         .subscription(subscription)
         .window(iced::window::Settings {

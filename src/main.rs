@@ -18,6 +18,7 @@ mod listpicker;
 mod output;
 mod picker_ring;
 mod pill;
+mod result;
 
 use anyhow::Result;
 use config::{Config, config_path};
@@ -35,6 +36,9 @@ fn main() -> Result<()> {
     }
     if args.iter().any(|a| a == "--listpicker") {
         return listpicker::run();
+    }
+    if args.iter().any(|a| a == "--result") {
+        return result::run();
     }
     if args.iter().any(|a| a == "--list") {
         return list_modes();

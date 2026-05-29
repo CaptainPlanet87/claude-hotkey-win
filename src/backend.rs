@@ -22,6 +22,7 @@ fn claude_program() -> std::ffi::OsString {
 }
 
 pub trait Backend {
+    #[allow(dead_code)] // fuer Logging/zukuenftige Backends, aktuell ungenutzt
     fn name(&self) -> &'static str;
     fn query(&self, prompt: &str, text: &str, timeout: Duration) -> Result<String>;
 }
@@ -114,6 +115,33 @@ pub fn get_backend(name: &str) -> Option<Box<dyn Backend>> {
     match name {
         "claude" => Some(Box::new(ClaudeBackend)),
         _ => None,
+    }
+}
+
+/// Startet einen UNABHAENGIGEN Worker-Prozess (`--mode <id> --text-from-stdin`),
+/// der die Auswahl verarbeitet und das Popup zeigt. Wichtig: laeuft eigenstaendig
+/// weiter, auch wenn der aufrufende Picker direkt danach mit `process::exit(0)`
+/// beendet. (Frueher lief das in einem Thread, der genau dadurch sofort
+/// mitgekillt wurde -> es kam nie eine Antwort.)
+/// Die Auswahl geht ueber stdin (kein Arg-Laengen-/Escaping-Problem); der Worker
+/// liest parallel mit, daher blockiert auch grosser Text nicht.
+pub fn spawn_mode_worker(mode_id: &str, selection: &str) {
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("claude-hotkey.exe"));
+    match Command::new(exe)
+        .args(["--mode", mode_id, "--text-from-stdin"])
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(selection.as_bytes());
+                // stdin droppt hier -> Pipe-EOF -> Worker kann zu Ende lesen.
+            }
+            // Bewusst NICHT auf das Kind warten: es lebt eigenstaendig weiter
+            // und zeigt selbst das Popup.
+        }
+        Err(e) => log::error!("mode-worker spawn: {e}"),
     }
 }
 

@@ -10,6 +10,7 @@ use crate::config::Config;
 use anyhow::{Result, bail};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, hotkey::{Code, HotKey, Modifiers}};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -110,19 +111,140 @@ enum Action {
     TogglePill,
 }
 
+// ===== Ctrl+Shift-Doppeltipp via Low-Level-Keyboard-Hook =====
+// RegisterHotKey kann keine reinen Modifier. Daher ein WH_KEYBOARD_LL-Hook,
+// der zwei saubere Ctrl+Shift-"Chords" (beide Modifier runter+hoch, ohne andere
+// Taste dazwischen) innerhalb von DOUBLE_WINDOW_MS erkennt -> Picker.
+// Das Flag wird im Event-Loop gepollt.
+static GESTURE_FIRED: AtomicBool = AtomicBool::new(false);
+static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
+static CHORD_ARMED: AtomicBool = AtomicBool::new(false);
+static OTHER_DOWN: AtomicBool = AtomicBool::new(false);
+static LAST_CHORD_MS: AtomicI64 = AtomicI64::new(0);
+const DOUBLE_WINDOW_MS: i64 = 450;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn ll_keyboard_proc(
+    code: i32,
+    wparam: winapi::shared::minwindef::WPARAM,
+    lparam: winapi::shared::minwindef::LPARAM,
+) -> winapi::shared::minwindef::LRESULT {
+    use winapi::um::winuser::{
+        CallNextHookEx, HC_ACTION, KBDLLHOOKSTRUCT, VK_CONTROL, VK_LCONTROL, VK_LSHIFT, VK_RCONTROL,
+        VK_RSHIFT, VK_SHIFT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+    if code == HC_ACTION {
+        let kb = &*(lparam as *const KBDLLHOOKSTRUCT);
+        let vk = kb.vkCode as i32;
+        let down = wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize;
+        let up = wparam == WM_KEYUP as usize || wparam == WM_SYSKEYUP as usize;
+        let is_ctrl = vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL;
+        let is_shift = vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT;
+
+        if down {
+            if is_ctrl {
+                CTRL_DOWN.store(true, Ordering::SeqCst);
+            } else if is_shift {
+                SHIFT_DOWN.store(true, Ordering::SeqCst);
+            } else {
+                OTHER_DOWN.store(true, Ordering::SeqCst);
+            }
+            if CTRL_DOWN.load(Ordering::SeqCst)
+                && SHIFT_DOWN.load(Ordering::SeqCst)
+                && !OTHER_DOWN.load(Ordering::SeqCst)
+            {
+                CHORD_ARMED.store(true, Ordering::SeqCst);
+            }
+        } else if up {
+            if is_ctrl {
+                CTRL_DOWN.store(false, Ordering::SeqCst);
+            }
+            if is_shift {
+                SHIFT_DOWN.store(false, Ordering::SeqCst);
+            }
+            if !CTRL_DOWN.load(Ordering::SeqCst) && !SHIFT_DOWN.load(Ordering::SeqCst) {
+                if CHORD_ARMED.load(Ordering::SeqCst) && !OTHER_DOWN.load(Ordering::SeqCst) {
+                    let now = now_ms();
+                    let last = LAST_CHORD_MS.swap(now, Ordering::SeqCst);
+                    if last != 0 && now - last <= DOUBLE_WINDOW_MS {
+                        GESTURE_FIRED.store(true, Ordering::SeqCst);
+                        LAST_CHORD_MS.store(0, Ordering::SeqCst);
+                    }
+                }
+                CHORD_ARMED.store(false, Ordering::SeqCst);
+                OTHER_DOWN.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+    CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+}
+
+#[cfg(windows)]
+fn install_ll_hook() {
+    // Eigener Thread mit eigener GetMessage-Schleife: LL-Hooks muessen auf dem
+    // installierenden Thread *prompt* bedient werden (Windows LowLevelHooksTimeout).
+    // Der tao-Thread schlaeft 50ms pro Runde und ist dafuer ungeeignet -> Hook
+    // wurde nie aufgerufen.
+    std::thread::spawn(|| {
+        use winapi::um::libloaderapi::GetModuleHandleW;
+        use winapi::um::winuser::{
+            GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, WH_KEYBOARD_LL,
+        };
+        unsafe {
+            let hmod = GetModuleHandleW(std::ptr::null());
+            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), hmod, 0);
+            if hook.is_null() {
+                log::warn!("LL-Keyboard-Hook nicht installiert — Ctrl+Shift-Doppeltipp inaktiv");
+                return;
+            }
+            log::info!("LL-Keyboard-Hook aktiv (eigener Thread): Ctrl+Shift-Doppeltipp -> Picker");
+            let mut msg: MSG = std::mem::zeroed();
+            // GetMessageW haelt den Thread am Pumpen -> Hook wird prompt bedient.
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
+            UnhookWindowsHookEx(hook);
+        }
+    });
+}
+
+/// Registriert einen Hotkey best-effort und gibt dessen id zurueck (oder None).
+fn register_hotkey(manager: &GlobalHotKeyManager, spec: &str, name: &str) -> Option<u32> {
+    match parse_hotkey(spec) {
+        Ok(hk) => match manager.register(hk) {
+            Ok(_) => {
+                log::info!("{name}-Hotkey '{spec}' registriert");
+                Some(hk.id())
+            }
+            Err(e) => {
+                log::warn!("{name}-Hotkey '{spec}' nicht registrierbar: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            log::warn!("{name}-Hotkey '{spec}' ungueltig: {e}");
+            None
+        }
+    }
+}
+
 pub fn run_daemon(cfg: Config) -> Result<()> {
     let manager = GlobalHotKeyManager::new()?;
-    let picker = parse_hotkey(&cfg.picker_hotkey)?;
-    let pill = parse_hotkey(&cfg.pill_toggle_hotkey)?;
-    manager.register(picker)?;
-    manager.register(pill)?;
-    log::info!(
-        "Hotkeys registriert: picker='{}' pill='{}'",
-        cfg.picker_hotkey, cfg.pill_toggle_hotkey
-    );
 
-    let picker_id = picker.id();
-    let pill_id = pill.id();
+    // Hotkeys best-effort registrieren (Konflikt/Fehler killt den Daemon nicht;
+    // der Ctrl+Shift-Doppeltipp funktioniert unabhaengig).
+    let picker_id = register_hotkey(&manager, &cfg.picker_hotkey, "picker");
+    let pill_id = register_hotkey(&manager, &cfg.pill_toggle_hotkey, "pill");
+
+    // Ctrl+Shift-Doppeltipp via Low-Level-Keyboard-Hook.
+    #[cfg(windows)]
+    install_ll_hook();
 
     let pill_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
@@ -130,13 +252,24 @@ pub fn run_daemon(cfg: Config) -> Result<()> {
     let receiver = GlobalHotKeyEvent::receiver();
 
     event_loop.run(move |_event: Event<()>, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        // Poll statt Wait: global-hotkey liefert Events über einen eigenen
+        // Hintergrund-Thread in einen Channel. Mit Wait würde tao mangels
+        // Fenster nach dem ersten Durchlauf dauerhaft in GetMessage blockieren
+        // und den Channel nie wieder leeren -> Hotkeys reagieren nicht.
+        *control_flow = ControlFlow::Poll;
+
+        // Ctrl+Shift-Doppeltipp (Low-Level-Hook)?
+        if GESTURE_FIRED.swap(false, Ordering::SeqCst) {
+            log::info!("[gesture] Ctrl+Shift Doppeltipp -> Picker");
+            spawn_listpicker();
+        }
+
         // Hotkey-Channel hat globale Events — non-blocking polling
         while let Ok(ev) = receiver.try_recv() {
             if ev.state() == global_hotkey::HotKeyState::Pressed {
-                let action = if ev.id() == picker_id {
+                let action = if Some(ev.id()) == picker_id {
                     Some(Action::OpenPicker)
-                } else if ev.id() == pill_id {
+                } else if Some(ev.id()) == pill_id {
                     Some(Action::TogglePill)
                 } else {
                     None
@@ -163,42 +296,32 @@ fn spawn_listpicker() {
 }
 
 fn toggle_pill(pill_child: &Arc<Mutex<Option<Child>>>) {
-    // Auch alle stray pill/picker prozesse berücksichtigen (via pgrep-Äquivalent: tasklist)
-    let pill_running = is_running("--pill");
-    let picker_running = is_running("--picker");
-    log::info!("[toggle_pill] pill={pill_running} picker={picker_running}");
+    // Schnell & ohne wmic: den bereits getrackten Pillen-Child per try_wait
+    // pruefen. (wmic ist auf Win11 deprecated und braucht mehrere Sekunden pro
+    // Aufruf, was den Pillen-Toggle spuerbar verzoegert hat.)
+    let mut guard = pill_child.lock().unwrap();
+    let pill_alive = matches!(guard.as_mut().map(|c| c.try_wait()), Some(Ok(None)));
+    log::info!("[toggle_pill] pill_alive={pill_alive}");
 
-    if pill_running || picker_running {
-        kill_all_by_args("--pill");
-        kill_all_by_args("--picker");
-        if let Some(mut c) = pill_child.lock().unwrap().take() {
+    if pill_alive {
+        if let Some(mut c) = guard.take() {
             let _ = c.kill();
             let _ = c.wait();
         }
+        // evtl. offenes Halbkreis-Menue (Klick-Spawn der Pille) mitschliessen
+        kill_all_by_args("--picker");
         return;
     }
 
+    // tote/abgestuerzte Referenz verwerfen, dann frisch starten
+    *guard = None;
     match Command::new(self_exe()).arg("--pill").spawn() {
         Ok(child) => {
             log::info!("Pille gestartet PID {}", child.id());
-            *pill_child.lock().unwrap() = Some(child);
+            *guard = Some(child);
         }
         Err(e) => log::error!("Pille spawn: {e}"),
     }
-}
-
-/// Sucht claude-hotkey.exe-Prozesse mit dem gegebenen Argument
-fn is_running(arg: &str) -> bool {
-    // tasklist /V zeigt nur Window-Titles, nicht command-line.
-    // Wir nutzen wmic process get commandline.
-    let out = Command::new("wmic")
-        .args(["process", "where", "name='claude-hotkey.exe'", "get", "commandline"])
-        .output();
-    if let Ok(o) = out {
-        let s = String::from_utf8_lossy(&o.stdout);
-        return s.contains(arg);
-    }
-    false
 }
 
 fn kill_all_by_args(arg: &str) {

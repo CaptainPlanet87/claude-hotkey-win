@@ -8,6 +8,19 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// Findet das claude-Binary robust: bevorzugt den nativen Installer-Pfad
+/// (~/.local/bin/claude.exe), sonst PATH. Wichtig, weil der per Task-Scheduler
+/// gestartete Daemon ~/.local/bin evtl. nicht im PATH hat.
+fn claude_program() -> std::ffi::OsString {
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join(".local").join("bin").join("claude.exe");
+        if p.exists() {
+            return p.into_os_string();
+        }
+    }
+    std::ffi::OsString::from("claude")
+}
+
 pub trait Backend {
     fn name(&self) -> &'static str;
     fn query(&self, prompt: &str, text: &str, timeout: Duration) -> Result<String>;
@@ -27,11 +40,23 @@ impl Backend for ClaudeBackend {
             format!("{prompt}\n\n---\n\n{text}")
         };
 
-        let mut child = Command::new("claude")
-            .arg("--print")
+        let mut cmd = Command::new(claude_program());
+        cmd.arg("--print")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        // claude.exe braucht ~/.local/bin im PATH, sonst exit 129, wenn der per
+        // Task-Scheduler gestartete Daemon das Verzeichnis nicht geerbt hat.
+        if let Some(home) = dirs::home_dir() {
+            let bin = home.join(".local").join("bin");
+            let cur = std::env::var_os("PATH").unwrap_or_default();
+            let mut search: Vec<std::path::PathBuf> = vec![bin];
+            search.extend(std::env::split_paths(&cur));
+            if let Ok(joined) = std::env::join_paths(search) {
+                cmd.env("PATH", joined);
+            }
+        }
+        let mut child = cmd
             .spawn()
             .context("claude --print starten (claude.exe im PATH?)")?;
 

@@ -8,7 +8,10 @@ use iced::keyboard::{self, Key, key::Named};
 use iced::theme::Style as Appearance;
 use iced::widget::{button, column, container, scrollable, text};
 use iced::window::{Level, Position};
-use iced::{Background, Border, Color, Element, Event, Length, Shadow, Size, Subscription, Task, Theme};
+use iced::{
+    Background, Border, Color, Element, Event, Length, Point, Shadow, Size, Subscription, Task,
+    Theme,
+};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -187,6 +190,55 @@ fn focus_on_open() -> Task<Message> {
     iced::window::latest().and_then(iced::window::gain_focus::<Message>)
 }
 
+/// Cursor-Position (Bildschirm-Pixel) fuer das "Menue am Mauszeiger".
+/// `Position::SpecificWith` will einen FN-POINTER (kein capture-Closure), daher
+/// die Koordinaten ueber diesen OnceLock statt per Closure-Capture.
+static CURSOR_POS: OnceLock<(f32, f32)> = OnceLock::new();
+
+/// System-Skalierung (DPI/96). winit hat zum Zeitpunkt von `cursor_specific`
+/// die DPI-Awareness gesetzt -> GetDpiForSystem liefert den echten Wert.
+fn system_scale() -> f32 {
+    #[cfg(windows)]
+    {
+        let dpi = unsafe { winapi::um::winuser::GetDpiForSystem() };
+        if dpi >= 48 {
+            return dpi as f32 / 96.0;
+        }
+    }
+    1.0
+}
+
+/// Plaziert das Fenster am Cursor, geclamped auf den Bildschirm (kein Ueberlauf).
+/// CURSOR_POS sind PHYSISCHE Pixel (Maus-Hook); iced/winit rechnet in LOGISCHEN
+/// Pixeln -> erst per System-Skalierung umrechnen, sonst landet das Fenster bei
+/// Skalierung > 100% unten rechts.
+fn cursor_specific(win: Size, screen: Size) -> Point {
+    let (px, py) = CURSOR_POS.get().copied().unwrap_or((0.0, 0.0));
+    let scale = system_scale();
+    let cx = px / scale;
+    let cy = py / scale;
+    let x = cx.min((screen.width - win.width).max(0.0)).max(0.0);
+    let y = cy.min((screen.height - win.height).max(0.0)).max(0.0);
+    Point::new(x, y)
+}
+
+/// Position: am Mauszeiger, wenn per `--at X Y` uebergeben (Strg+Rechtsklick),
+/// sonst zentriert (Tastatur-Geste/Hotkey).
+/// Hinweis: X/Y sind Bildschirm-Pixel; bei DPI-Skalierung != 100% kann die
+/// Position leicht abweichen (dann ggf. Skalierung einrechnen).
+fn picker_position() -> Position {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--at") {
+        if let (Some(xs), Some(ys)) = (args.get(i + 1), args.get(i + 2)) {
+            if let (Ok(cx), Ok(cy)) = (xs.parse::<f32>(), ys.parse::<f32>()) {
+                let _ = CURSOR_POS.set((cx, cy));
+                return Position::SpecificWith(cursor_specific);
+            }
+        }
+    }
+    Position::Centered
+}
+
 pub fn run() -> anyhow::Result<()> {
     let sel = output::get_selection_via_clipboard().unwrap_or_default();
     if sel.trim().is_empty() {
@@ -213,7 +265,7 @@ pub fn run() -> anyhow::Result<()> {
             transparent: true,
             resizable: false,
             level: Level::AlwaysOnTop,
-            position: Position::Centered,
+            position: picker_position(),
             ..Default::default()
         })
         .run()

@@ -10,7 +10,7 @@ use crate::config::Config;
 use anyhow::{Result, bail};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, hotkey::{Code, HotKey, Modifiers}};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -125,6 +125,15 @@ static SHIFT_TAPS: AtomicI64 = AtomicI64::new(0);
 static LAST_SHIFT_MS: AtomicI64 = AtomicI64::new(0);
 const SHIFT_DOUBLE_WINDOW_MS: i64 = 600;
 
+// ===== Geste 2: Strg + Rechtsklick -> Picker am Mauszeiger =====
+// Reines globales Rechtsklick-Abfangen wuerde normale Kontextmenues ueberall
+// kaputtmachen -> daher NUR bei gehaltenem Strg. Flag + Cursor-Position werden
+// im Event-Loop gepollt; SUPPRESS_RUP schluckt das zum Down gehoerige Up.
+static RCLICK_FIRED: AtomicBool = AtomicBool::new(false);
+static RCLICK_X: AtomicI32 = AtomicI32::new(0);
+static RCLICK_Y: AtomicI32 = AtomicI32::new(0);
+static SUPPRESS_RUP: AtomicBool = AtomicBool::new(false);
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -192,29 +201,69 @@ unsafe extern "system" fn ll_keyboard_proc(
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
+// LL-Maus-Hook: Rechtsklick bei gehaltenem Strg (CTRL_DOWN s.o.) -> Picker am
+// Mauszeiger. Das Rechtsklick-Event wird NUR in diesem Fall geschluckt, damit
+// nicht zusaetzlich das Kontextmenue der App aufgeht. Ohne Strg: nichts.
+#[cfg(windows)]
+unsafe extern "system" fn ll_mouse_proc(
+    code: i32,
+    wparam: winapi::shared::minwindef::WPARAM,
+    lparam: winapi::shared::minwindef::LPARAM,
+) -> winapi::shared::minwindef::LRESULT {
+    use winapi::um::winuser::{
+        CallNextHookEx, HC_ACTION, MSLLHOOKSTRUCT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    };
+    if code == HC_ACTION {
+        let msg = wparam as u32;
+        if msg == WM_RBUTTONDOWN && CTRL_DOWN.load(Ordering::SeqCst) {
+            let ms = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+            RCLICK_X.store(ms.pt.x, Ordering::SeqCst);
+            RCLICK_Y.store(ms.pt.y, Ordering::SeqCst);
+            RCLICK_FIRED.store(true, Ordering::SeqCst);
+            SUPPRESS_RUP.store(true, Ordering::SeqCst);
+            return 1; // Down schlucken -> kein App-Kontextmenue
+        }
+        if msg == WM_RBUTTONUP && SUPPRESS_RUP.swap(false, Ordering::SeqCst) {
+            return 1; // zugehoeriges Up ebenfalls schlucken
+        }
+    }
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
 #[cfg(windows)]
 fn install_ll_hook() {
     // Eigener Thread mit eigener GetMessage-Schleife: LL-Hooks muessen auf dem
     // installierenden Thread *prompt* bedient werden (Windows LowLevelHooksTimeout).
-    // Der tao-Thread schlaeft 50ms pro Runde und ist dafuer ungeeignet -> Hook
-    // wurde nie aufgerufen.
+    // Der tao-Thread schlaeft 50ms pro Runde und ist dafuer ungeeignet.
+    // Beide Hooks (Tastatur + Maus) laufen auf DIESEM Thread / einer Pumpe.
     std::thread::spawn(|| {
         use winapi::um::libloaderapi::GetModuleHandleW;
         use winapi::um::winuser::{
-            GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, WH_KEYBOARD_LL,
+            GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, WH_KEYBOARD_LL, WH_MOUSE_LL,
         };
         unsafe {
             let hmod = GetModuleHandleW(std::ptr::null());
-            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), hmod, 0);
-            if hook.is_null() {
+            let kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), hmod, 0);
+            if kb.is_null() {
                 log::warn!("LL-Keyboard-Hook nicht installiert — Geste (Strg halten + Shift 2x) inaktiv");
-                return;
+            } else {
+                log::info!("LL-Keyboard-Hook aktiv: Strg halten + Shift 2x -> Picker");
             }
-            log::info!("LL-Keyboard-Hook aktiv (eigener Thread): Strg halten + Shift 2x -> Picker");
+            let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), hmod, 0);
+            if mouse.is_null() {
+                log::warn!("LL-Maus-Hook nicht installiert — Strg+Rechtsklick inaktiv");
+            } else {
+                log::info!("LL-Maus-Hook aktiv: Strg+Rechtsklick -> Picker am Cursor");
+            }
             let mut msg: MSG = std::mem::zeroed();
-            // GetMessageW haelt den Thread am Pumpen -> Hook wird prompt bedient.
+            // GetMessageW haelt den Thread am Pumpen -> Hooks werden prompt bedient.
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
-            UnhookWindowsHookEx(hook);
+            if !kb.is_null() {
+                UnhookWindowsHookEx(kb);
+            }
+            if !mouse.is_null() {
+                UnhookWindowsHookEx(mouse);
+            }
         }
     });
 }
@@ -247,7 +296,8 @@ pub fn run_daemon(cfg: Config) -> Result<()> {
     let picker_id = register_hotkey(&manager, &cfg.picker_hotkey, "picker");
     let pill_id = register_hotkey(&manager, &cfg.pill_toggle_hotkey, "pill");
 
-    // Geste "Strg halten + Shift 2x" via Low-Level-Keyboard-Hook.
+    // Low-Level-Hooks: Tastatur-Geste (Strg halten + Shift 2x) und
+    // Maus-Geste (Strg + Rechtsklick) -> Picker.
     #[cfg(windows)]
     install_ll_hook();
 
@@ -267,6 +317,14 @@ pub fn run_daemon(cfg: Config) -> Result<()> {
         if GESTURE_FIRED.swap(false, Ordering::SeqCst) {
             log::info!("[gesture] Strg halten + Shift 2x -> Picker");
             spawn_listpicker();
+        }
+
+        // Strg+Rechtsklick (Low-Level-Maus-Hook) -> Picker am Mauszeiger?
+        if RCLICK_FIRED.swap(false, Ordering::SeqCst) {
+            let x = RCLICK_X.load(Ordering::SeqCst);
+            let y = RCLICK_Y.load(Ordering::SeqCst);
+            log::info!("[rclick] Strg+Rechtsklick @ {x},{y} -> Picker");
+            spawn_listpicker_at(Some((x, y)));
         }
 
         // Hotkey-Channel hat globale Events — non-blocking polling
@@ -294,7 +352,17 @@ pub fn run_daemon(cfg: Config) -> Result<()> {
 }
 
 fn spawn_listpicker() {
-    match Command::new(self_exe()).arg("--listpicker").spawn() {
+    spawn_listpicker_at(None);
+}
+
+fn spawn_listpicker_at(pos: Option<(i32, i32)>) {
+    let mut cmd = Command::new(self_exe());
+    cmd.arg("--listpicker");
+    if let Some((x, y)) = pos {
+        // Cursor-Position fuer das "Kontextmenue am Mauszeiger".
+        cmd.args(["--at", &x.to_string(), &y.to_string()]);
+    }
+    match cmd.spawn() {
         Ok(_) => log::info!("listpicker gestartet"),
         Err(e) => log::error!("listpicker spawn: {e}"),
     }
